@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mac 唤醒原型</title>
+<style>body{font:17px system-ui;max-width:560px;margin:50px auto;padding:24px;color:#203044;background:#f4f6f8}main{background:white;padding:28px;border-radius:20px}input,button{box-sizing:border-box;width:100%;padding:14px;margin:10px 0;font:inherit;border-radius:10px;border:1px solid #bbb}button{background:#1769de;color:white;border:0;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px system-ui}small{color:#596575}</style>
+<main><h1>Mac 唤醒</h1><p>ESP32-S3 · 点灯云端与局域网控制</p>
+<label for="token">控制口令</label><input id="token" type="password" autocomplete="off" placeholder="烧录时配置的口令">
+<button id="wake">发送唤醒请求</button><pre id="status" aria-live="polite">正在读取设备状态…</pre>
+<small>显示的是板端状态。USB 恢复不代表 Mac 已恢复远程桌面，请在远程桌面客户端确认。此页面使用局域网 HTTP，不能直接公开到互联网。</small></main>
+<script>
+const labels={sleep_already_suspended:'USB 已挂起，未发送睡眠快捷键',sleep_shortcut_sent_unconfirmed:'睡眠快捷键已发送，请确认 Mac 状态',sleep_shortcut_failed:'睡眠快捷键发送失败',idle:'尚未请求',queued:'已排队',working:'正在处理',usb_detached:'USB 未连接或未完成识别',remote_wakeup_denied:'Mac 未授权本次 USB 唤醒',resume_signal_rejected:'USB 唤醒请求未被协议栈接受',resume_timeout:'请求已发出，但未在 5 秒内观察到 USB 恢复',usb_resumed_unconfirmed:'USB 已恢复，Mac 是否可远程连接仍待确认',host_bus_active:'USB 当前已活动；这不能证明 Mac 已醒来',shift_sent_unconfirmed:'Shift 已发送并释放，Mac 是否可连接仍待确认',hid_not_ready:'键盘端点尚未就绪',key_release_pending:'正在重试释放 Shift',usb_disconnected:'处理期间 USB 已断开'};
+const cloudLabels={disabled:'未配置',waiting_wifi:'等待 Wi-Fi',waiting_clock:'正在校准时间',authenticating:'正在认证',auth_failed:'认证失败，稍后重试',connecting:'正在连接',subscribing:'正在订阅',online:'在线',reconnecting:'正在重连',refreshing_auth:'正在更新认证',init_failed:'初始化失败',connect_failed:'连接失败'};
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('读取失败');const s=await r.json();document.getElementById('status').textContent=`点灯云端：${cloudLabels[s.cloud_state]||s.cloud_state||'未配置'}\nUSB：${s.mounted?'已识别':'未识别'} / ${s.suspended?'已挂起':'活动或未连接'}\n主机唤醒授权：${s.remote_wakeup_allowed?'有':'无'}\n请求 #${s.request_id}：${labels[s.result]||s.result}\n运行时间：${s.uptime_s} 秒\nMac 在线状态：未验证`;}catch(e){document.getElementById('status').textContent='无法连接开发板，请检查供电及 Wi-Fi。';}}
+document.getElementById('wake').onclick=async()=>{const b=document.getElementById('wake');b.disabled=true;try{const r=await fetch('/api/wake',{method:'POST',headers:{Authorization:'Bearer '+document.getElementById('token').value}});if(!r.ok){const s=await r.json();throw Error(s.error||'请求失败');}await refresh();}catch(e){document.getElementById('status').textContent=e.message;}finally{b.disabled=false;}};
+refresh();setInterval(refresh,2000);
+</script></html>

@@ -1,0 +1,20 @@
+menu "Mac Wake S3"
+    config WAKE_WIFI_SSID
+        string "2.4 GHz Wi-Fi SSID (empty = button only)"
+        default ""
+    config WAKE_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+    config WAKE_API_TOKEN
+        string "LAN API token (at least 32 characters)"
+        default ""
+    config WAKE_BLINKER_KEY
+        string "Blinker independent-device Auth Key (empty disables cloud)"
+        default ""
+    config WAKE_SEND_SHIFT
+        bool "Send a Shift press/release after resume or when USB is active"
+        default n
+        help
+            Optional fallback. Default only sends USB remote resume.
+            Enable only after testing; this can affect a foreground application.
+endmenu

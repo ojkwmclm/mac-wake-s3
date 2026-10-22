@@ -1,0 +1,16 @@
+/build/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.local
+/sdkconfig.local.old
+
+# Private inputs, generated builds and local logs
+/work/
+/private/
+.env
+.env.*
+*.log
+__pycache__/
+*.pyc
+.DS_Store

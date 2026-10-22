@@ -1,0 +1,1 @@
+2d3dd7c842e5e20d4ebcf7b893ae8d4b36b53d368d82e0a1509b85eaa4227f39  mac-wake-s3-button-v0.1.bin
