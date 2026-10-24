@@ -8,12 +8,14 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_event.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "mdns.h"
 #include "tinyusb.h"
 #include "class/hid/hid_device.h"
 #include "blinker_cloud.h"
@@ -275,6 +277,74 @@ static void button_task(void *arg)
     }
 }
 
+static esp_err_t json_response(httpd_req_t *req, const char *status, const char *body)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+static esp_err_t home_handler(httpd_req_t *req)
+{
+    extern const char index_start[] asm("_binary_index_html_start");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    return httpd_resp_sendstr(req, index_start);
+}
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    bool m, s, a, b; uint32_t id; const char *r;
+    portENTER_CRITICAL(&state_lock);
+    m = mounted; s = suspended; a = wake_allowed; b = busy;
+    id = request_id; r = result;
+    portEXIT_CRITICAL(&state_lock);
+    char body[512];
+    snprintf(body, sizeof(body),
+        "{\"mounted\":%s,\"suspended\":%s,\"remote_wakeup_allowed\":%s,"
+        "\"busy\":%s,\"request_id\":%lu,\"result\":\"%s\","
+        "\"uptime_s\":%lld,\"mac_online\":null,\"cloud_state\":\"%s\"}",
+        m?"true":"false", s?"true":"false", a?"true":"false", b?"true":"false",
+        (unsigned long)id, r, (long long)(esp_timer_get_time()/1000000), blinker_cloud_state());
+    return json_response(req, "200 OK", body);
+}
+static bool authorized(httpd_req_t *req)
+{
+    const size_t token_len = strlen(CONFIG_WAKE_API_TOKEN);
+    if (token_len < 32 || token_len > 128) return false;
+    char header[136];
+    if (httpd_req_get_hdr_value_len(req, "Authorization") != token_len + 7 ||
+        httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) != ESP_OK ||
+        strncmp(header, "Bearer ", 7) != 0) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < token_len; ++i)
+        diff |= (unsigned char)(header[7+i] ^ CONFIG_WAKE_API_TOKEN[i]);
+    return diff == 0;
+}
+static esp_err_t wake_handler(httpd_req_t *req)
+{
+    if (!authorized(req)) return json_response(req, "401 Unauthorized", "{\"error\":\"控制口令错误或未配置至少32位口令\"}");
+    uint32_t id;
+    if (!enqueue_wake(&id)) return json_response(req, "429 Too Many Requests", "{\"error\":\"设备忙，请至少等待3秒再试\"}");
+    char body[96];
+    snprintf(body, sizeof(body), "{\"accepted\":true,\"request_id\":%lu,\"mac_online\":null}", (unsigned long)id);
+    return json_response(req, "202 Accepted", body);
+}
+static void start_http(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.lru_purge_enable = true; cfg.stack_size = 6144;
+    httpd_handle_t server;
+    ESP_ERROR_CHECK(httpd_start(&server, &cfg));
+    const httpd_uri_t routes[] = {
+        {.uri="/", .method=HTTP_GET, .handler=home_handler},
+        {.uri="/api/status", .method=HTTP_GET, .handler=status_handler},
+        {.uri="/api/wake", .method=HTTP_POST, .handler=wake_handler},
+    };
+    for (size_t i = 0; i < sizeof(routes)/sizeof(routes[0]); ++i)
+        ESP_ERROR_CHECK(httpd_register_uri_handler(server, &routes[i]));
+}
 static void reconnect(void *arg)
 { (void)arg; esp_wifi_connect(); }
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -288,7 +358,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         esp_timer_stop(reconnect_timer);
         const ip_event_got_ip_t *event = data;
-        ESP_LOGI(TAG, "Wi-Fi connected: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Phone page: http://" IPSTR "/", IP2STR(&event->ip_info.ip));
     }
 }
 static void start_wifi(void)
@@ -319,7 +389,16 @@ static void start_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    start_http();
     blinker_cloud_start(enqueue_wake, enqueue_sleep, cloud_snapshot);
+    if (mdns_init() == ESP_OK) {
+        ESP_ERROR_CHECK(mdns_hostname_set("mac-wake-s3"));
+        ESP_ERROR_CHECK(mdns_instance_name_set("Mac Wake S3"));
+        ESP_ERROR_CHECK(mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0));
+        ESP_LOGI(TAG, "Phone page: http://mac-wake-s3.local/");
+    } else {
+        ESP_LOGW(TAG, "mDNS unavailable; use IP address from log");
+    }
 }
 void app_main(void)
 {
