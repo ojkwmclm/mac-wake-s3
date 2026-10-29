@@ -14,4 +14,11 @@ menu "Mac Wake S3"
         help
             Optional fallback. Default only sends USB remote resume.
             Enable only after testing; this can affect a foreground application.
+    config WAKE_HEALTH_FAULT_TEST
+        bool "TEST ONLY: pause USB worker 60s once after 60s uptime"
+        default n
+        help
+            Dedicated diagnostic image. Keeps yielding CPU, allowing cloud and
+            supervisor to run. Sleep/wake requests pause for up to one minute.
+            Automatically recovers. Never enable for unattended normal use.
 endmenu

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "health.h"
+#include "sdkconfig.h"
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,6 +19,19 @@ static portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t warning_mask;
 static char boot_id[17];
 static int reset_reason;
+#ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
+static bool fault_started;
+static const char *fault_state="armed";
+#endif
+const char *health_fault_state(void)
+{
+#ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
+    portENTER_CRITICAL(&lock); const char *value=fault_state;
+    portEXIT_CRITICAL(&lock); return value;
+#else
+    return "off";
+#endif
+}
 static const char *names[] = {"usb", "button", "cloud"};
 
 void health_init(void)
@@ -37,6 +51,20 @@ uint32_t health_warnings(void)
 void health_phase(health_task_t task, const char *phase, uint32_t warn_ms)
 {
     int64_t now = esp_timer_get_time();
+#ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
+    // Dedicated test image only: stop ONE worker's heartbeat, still yield CPU.
+    // No cloud command can enable this. Once per boot, automatically recovers.
+    if (task==HEALTH_USB && !fault_started && now>=INT64_C(60000000)) {
+        fault_started=true;
+        portENTER_CRITICAL(&lock); fault_state="usb_paused";
+        portEXIT_CRITICAL(&lock);
+        ESP_LOGW("health", "FAULT TEST: USB worker paused for 60s; keep Mac awake");
+        for (unsigned i=0;i<60;++i) vTaskDelay(pdMS_TO_TICKS(1000));
+        portENTER_CRITICAL(&lock); fault_state="recovered";
+        portEXIT_CRITICAL(&lock);
+        now=esp_timer_get_time();
+    }
+#endif
     portENTER_CRITICAL(&lock);
     obs[task] = (observation_t){.enabled=true, .at=now,
         .budget=(int64_t)warn_ms * 1000, .phase=phase};
