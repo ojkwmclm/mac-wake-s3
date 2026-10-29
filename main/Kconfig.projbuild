@@ -5,9 +5,6 @@ menu "Mac Wake S3"
     config WAKE_WIFI_PASSWORD
         string "Wi-Fi password"
         default ""
-    config WAKE_API_TOKEN
-        string "LAN API token (at least 32 characters)"
-        default ""
     config WAKE_BLINKER_KEY
         string "Blinker independent-device Auth Key (empty disables cloud)"
         default ""
