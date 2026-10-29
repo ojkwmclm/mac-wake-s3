@@ -17,14 +17,21 @@
 #include "tinyusb.h"
 #include "class/hid/hid_device.h"
 #include "blinker_cloud.h"
+#include "health.h"
+#include "recovery_policy.h"
 
 static const char *TAG = "mac_wake";
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 typedef struct { uint32_t id; bool sleep; } control_request_t;
 static QueueHandle_t wake_queue;
-static bool sleep_keyboard_release, sleep_consumer_release;
+static release_policy_t releases[2];
+static uint32_t release_acks, release_errors, usb_epoch;
+static hid_transfer_t transfers[2];
+static uint32_t release_epoch;
+static bool release_timeout_reported;
+static uint8_t release_mask_snapshot;
+static bool release_timeout_snapshot, inflight_timeout_snapshot;
 static bool mounted, suspended, wake_allowed, busy;
-static bool release_pending;
 static uint32_t request_id;
 static int64_t last_request_us;
 static const char *result = "idle";
@@ -71,17 +78,58 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t id,
     hid_report_type_t type, uint8_t const *buffer, uint16_t len)
 { (void)instance; (void)id; (void)type; (void)buffer; (void)len; }
 
+// Track EVERY input report, including presses. Endpoint-ready can become true
+// just before TinyUSB invokes its callback, so ready alone cannot authorize reuse.
+static bool submit_report(unsigned instance, const void *data, uint16_t len, bool zero)
+{
+    if (!tud_mounted() || tud_suspended() || !tud_hid_n_ready(instance)) return false;
+    portENTER_CRITICAL(&state_lock);
+    if (usb_epoch != release_epoch || !transfer_arm(&transfers[instance], usb_epoch)) {
+        portEXIT_CRITICAL(&state_lock); return false;
+    }
+    transfers[instance].zero=zero;
+    portEXIT_CRITICAL(&state_lock);
+    bool ok=tud_hid_n_report(instance, 0, data, len);
+    if (!ok) {
+        portENTER_CRITICAL(&state_lock); transfers[instance].armed=false;
+        portEXIT_CRITICAL(&state_lock);
+    }
+    return ok;
+}
+static bool submit_keyboard(uint8_t modifiers)
+{
+    uint8_t report[8]={modifiers,0};
+    return submit_report(0, report, sizeof(report), modifiers==0);
+}
+static void input_complete(uint8_t instance, bool ok, uint16_t len)
+{
+    if (instance>1) return;
+    portENTER_CRITICAL(&state_lock);
+    unsigned event=transfer_finish(&transfers[instance], usb_epoch,
+                                   ok, len==(instance ? 2 : 8));
+    if (event==1) release_acks |= 1U << instance;
+    if (event==2) release_errors |= 1U << instance;
+    portEXIT_CRITICAL(&state_lock);
+}
+// Transport completion is not a macOS sleep/wake acknowledgement.
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len)
+{ (void)report; input_complete(instance, true, len); }
+void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t type,
+                             uint8_t const *report, uint16_t len)
+{ (void)report; if (type==HID_REPORT_TYPE_INPUT) input_complete(instance, false, len); }
 void tud_mount_cb(void)
 {
     portENTER_CRITICAL(&state_lock);
     mounted = true; suspended = false; wake_allowed = false;
+    ++usb_epoch; memset(transfers, 0, sizeof(transfers)); release_acks=release_errors=0;
     portEXIT_CRITICAL(&state_lock);
     ESP_LOGI(TAG, "USB mounted");
 }
 void tud_umount_cb(void)
 {
     portENTER_CRITICAL(&state_lock);
-    mounted = false; suspended = false; wake_allowed = false;
+    mounted = false; suspended = false; wake_allowed = false; ++usb_epoch;
+    memset(transfers, 0, sizeof(transfers)); release_acks=release_errors=0;
     portEXIT_CRITICAL(&state_lock);
     ESP_LOGI(TAG, "USB unmounted");
 }
@@ -128,42 +176,97 @@ static bool enqueue_action(bool sleep, uint32_t *id)
 static bool enqueue_wake(uint32_t *id) { return enqueue_action(false, id); }
 static bool enqueue_sleep(uint32_t *id) { return enqueue_action(true, id); }
 
-// Release reports only; never repeat the sleep shortcut after a disconnect/suspend.
-static void release_sleep_keys(void)
+static void publish_release_snapshot(void)
 {
-    if (!tud_mounted()) { sleep_keyboard_release = sleep_consumer_release = false; return; }
-    if (tud_suspended()) return;
-    uint16_t zero = 0;
-    if (sleep_consumer_release && tud_hid_n_ready(1) && tud_hid_n_report(1, 0, &zero, sizeof(zero)))
-        sleep_consumer_release = false;
-    if (sleep_keyboard_release && tud_hid_ready() && tud_hid_keyboard_report(0, 0, NULL))
-        sleep_keyboard_release = false;
+    portENTER_CRITICAL(&state_lock);
+    release_mask_snapshot=(releases[0].pending ? 1 : 0) | (releases[1].pending ? 2 : 0);
+    release_timeout_snapshot=releases[0].timed_out || releases[1].timed_out;
+    inflight_timeout_snapshot=releases[0].inflight_timed_out || releases[1].inflight_timed_out;
+    portEXIT_CRITICAL(&state_lock);
+}
+static bool keys_pending(void) { return releases[0].pending || releases[1].pending; }
+static void begin_release(unsigned instance)
+{
+    portENTER_CRITICAL(&state_lock); release_acks &= ~(1U << instance);
+    release_errors &= ~(1U << instance); portEXIT_CRITICAL(&state_lock);
+    release_begin(&releases[instance], esp_timer_get_time());
+    publish_release_snapshot();
+}
+// Keep releases queued during a legitimate host sleep; never repeat the shortcut.
+// Do not block the control queue: a remote-resume request must remain possible.
+static void service_releases(void)
+{
+    portENTER_CRITICAL(&state_lock);
+    uint32_t acks=release_acks, errors=release_errors, epoch=usb_epoch;
+    release_acks=release_errors=0;
+    portEXIT_CRITICAL(&state_lock);
+    if (epoch != release_epoch) {
+        // A real USB unmount invalidates the old endpoint transfers.
+        memset(releases, 0, sizeof(releases)); release_epoch=epoch;
+        release_timeout_reported=false;
+        publish_release_snapshot();
+        return;
+    }
+    bool m=tud_mounted(), suspended_now=tud_suspended();
+    for (int i=1; i>=0; --i) {
+        release_policy_t *p=&releases[i];
+        if (errors & (1U << i)) p->inflight=false;
+        bool due=release_poll(p, esp_timer_get_time(), m, suspended_now,
+                              p->inflight && (acks & (1U << i)));
+        if (due && tud_hid_n_ready(i)) {
+            uint8_t zero[8]={0};
+            // Worker is the sole submitter; completion flags are consumed next loop.
+            release_attempt(p, esp_timer_get_time(),
+                            submit_report(i, zero, i ? 2 : 8, true));
+        }
+    }
+    if ((releases[0].timed_out || releases[1].timed_out) && !release_timeout_reported) {
+        release_timeout_reported=true;
+        set_result("key_release_recovery_required");
+        ESP_LOGW(TAG, "Release incomplete after active-bus budget; wake remains available, no reset");
+    }
+    if (!keys_pending()) release_timeout_reported=false;
+    publish_release_snapshot();
+}
+static bool settle_releases(void)
+{
+    const int64_t deadline=esp_timer_get_time()+1000000;
+    do {
+        service_releases();
+        if (!keys_pending()) return true;
+        if (!tud_mounted() || tud_suspended()) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } while (esp_timer_get_time()<deadline);
+    return false;
 }
 static void send_sleep(void)
 {
     if (tud_suspended()) { set_result("sleep_already_suspended"); return; }
-    if (sleep_keyboard_release || sleep_consumer_release || !tud_hid_ready() || !tud_hid_n_ready(1)) {
+    if (!settle_releases() || !tud_hid_ready() || !tud_hid_n_ready(1)) {
         set_result("hid_not_ready"); return;
     }
     // Apple: Option-Command-Media Eject puts the Mac to sleep.
-    if (!tud_hid_keyboard_report(0, KEYBOARD_MODIFIER_LEFTALT | KEYBOARD_MODIFIER_LEFTGUI, NULL)) {
+    if (!submit_keyboard(KEYBOARD_MODIFIER_LEFTALT | KEYBOARD_MODIFIER_LEFTGUI)) {
         set_result("hid_not_ready"); return;
     }
-    sleep_keyboard_release = true;
+    begin_release(0);
     vTaskDelay(pdMS_TO_TICKS(30));
     uint16_t eject = 0x00b8; // Consumer Usage: Eject (not Power).
-    if (tud_mounted() && !tud_suspended() && tud_hid_n_report(1, 0, &eject, sizeof(eject))) {
-        sleep_consumer_release = true;
+    if (tud_mounted() && !tud_suspended() && submit_report(1, &eject, sizeof(eject), false)) {
+        begin_release(1);
         vTaskDelay(pdMS_TO_TICKS(30));
         set_result("sleep_shortcut_sent_unconfirmed");
     } else set_result("sleep_shortcut_failed");
-    release_sleep_keys();
+    service_releases();
 }
 
 static void cloud_snapshot(cloud_wake_status_t *s)
 {
     portENTER_CRITICAL(&state_lock);
     s->request_id = request_id; s->busy = busy; s->result = result;
+    s->release_mask=release_mask_snapshot; s->release_timeout=release_timeout_snapshot;
+    s->inflight_timeout=inflight_timeout_snapshot;
+    s->usb_epoch=usb_epoch; s->usb_mounted=mounted; s->usb_suspended=suspended;
     portEXIT_CRITICAL(&state_lock);
 }
 
@@ -179,17 +282,14 @@ static bool wait_hid_ready(int timeout_ms)
 }
 static void send_shift(void)
 {
-    if (!wait_hid_ready(1000) ||
-        !tud_hid_keyboard_report(0, KEYBOARD_MODIFIER_LEFTSHIFT, NULL)) {
+    if (!settle_releases() || !wait_hid_ready(1000) ||
+        !submit_keyboard(KEYBOARD_MODIFIER_LEFTSHIFT)) {
         set_result("hid_not_ready"); return;
     }
-    release_pending = true;
+    begin_release(0);
     vTaskDelay(pdMS_TO_TICKS(40));
-    if (wait_hid_ready(1000) && tud_hid_keyboard_report(0, 0, NULL)) {
-        release_pending = false; set_result("shift_sent_unconfirmed");
-    } else {
-        set_result("key_release_pending");
-    }
+    service_releases();
+    set_result("shift_sent_release_pending");
 }
 #endif
 static void wake_task(void *arg)
@@ -197,20 +297,10 @@ static void wake_task(void *arg)
     (void)arg;
     control_request_t request;
     while (true) {
-        release_sleep_keys();
-        if (release_pending) {
-            if (!tud_mounted()) {
-                release_pending = false; set_result("usb_disconnected");
-            } else if (tud_hid_ready() && tud_hid_keyboard_report(0, 0, NULL)) {
-                release_pending = false; set_result("shift_sent_unconfirmed");
-            }
-            if (!release_pending) {
-                portENTER_CRITICAL(&state_lock); busy = false;
-                portEXIT_CRITICAL(&state_lock);
-            }
-            vTaskDelay(pdMS_TO_TICKS(20)); continue;
-        }
+        health_phase(HEALTH_USB, "idle_or_release_service", 20000);
+        service_releases();
         if (xQueueReceive(wake_queue, &request, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+        health_phase(HEALTH_USB, request.sleep ? "sleep_request" : "wake_request", 20000);
         set_result("working");
         bool is_mounted, is_suspended, allowed;
         portENTER_CRITICAL(&state_lock);
@@ -249,10 +339,9 @@ static void wake_task(void *arg)
             send_shift();
 #endif
         }
-        if (!release_pending) {
-            portENTER_CRITICAL(&state_lock); busy = false;
-            portEXIT_CRITICAL(&state_lock);
-        }
+        // Release debt is separate from an executing request. Never hold busy forever.
+        portENTER_CRITICAL(&state_lock); busy = false;
+        portEXIT_CRITICAL(&state_lock);
     }
 }
 
@@ -261,6 +350,7 @@ static void button_task(void *arg)
     (void)arg;
     bool down = false; int low_ticks = 0, high_ticks = 0;
     while (true) {
+        health_phase(HEALTH_BUTTON, "poll", 5000);
         if (gpio_get_level(GPIO_NUM_0) == 0) {
             high_ticks = 0;
             if (low_ticks < 3) ++low_ticks;
@@ -323,6 +413,7 @@ static void start_wifi(void)
 }
 void app_main(void)
 {
+    health_init();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase()); err = nvs_flash_init();
@@ -345,6 +436,7 @@ void app_main(void)
     ESP_ERROR_CHECK(tinyusb_driver_install(&usb));
     ESP_ERROR_CHECK(xTaskCreate(wake_task, "wake", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(xTaskCreate(button_task, "button", 2048, NULL, 3, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    health_start_supervisor();
     start_wifi();
     ESP_LOGI(TAG, "Ready. BOOT button requests wake; do not hold BOOT during reset.");
 }

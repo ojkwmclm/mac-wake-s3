@@ -4,6 +4,10 @@
 typedef struct {
     uint32_t request_id;
     bool busy;
+    uint8_t release_mask;
+    uint32_t usb_epoch;
+    bool usb_mounted, usb_suspended;
+    bool release_timeout, inflight_timeout;
     const char *result;
 } cloud_wake_status_t;
 typedef bool (*cloud_wake_fn_t)(uint32_t *id);

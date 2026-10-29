@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "blinker_cloud.h"
 #include "cloud_command.h"
+#include "health.h"
+#include "recovery_policy.h"
+#include "esp_app_desc.h"
+#include "esp_wifi.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +33,7 @@ static char incoming[160], outgoing[160], will[512], uri[128];
 static char rx[1025];
 static int rx_used, rx_total;
 static bool rx_valid;
+static uint32_t report_seq;
 
 static void set_state(const char *value)
 {
@@ -163,6 +168,21 @@ static bool publish_state(const cloud_wake_status_t *s)
     cJSON_AddStringToObject(d, "result", s->result);
     cJSON_AddNumberToObject(d, "request_id", s->request_id);
     cJSON_AddNullToObject(d, "mac_online");
+    cJSON *diag=cJSON_AddObjectToObject(d, "health");
+    if (!diag) { cJSON_Delete(root); cJSON_Delete(d); return false; }
+    cJSON_AddStringToObject(diag, "boot_id", health_boot_id());
+    cJSON_AddNumberToObject(diag, "seq", ++report_seq);
+    cJSON_AddStringToObject(diag, "firmware", esp_app_get_description()->version);
+    cJSON_AddNumberToObject(diag, "uptime_s", esp_timer_get_time()/1000000);
+    cJSON_AddNumberToObject(diag, "reset_reason", health_reset_reason());
+    cJSON_AddStringToObject(diag, "supervisor", "warn_only");
+    cJSON_AddNumberToObject(diag, "stale_tasks", health_warnings());
+    cJSON_AddNumberToObject(diag, "release_mask", s->release_mask);
+    cJSON_AddBoolToObject(diag, "release_timeout", s->release_timeout);
+    cJSON_AddBoolToObject(diag, "inflight_timeout", s->inflight_timeout);
+    cJSON_AddNumberToObject(diag, "usb_epoch", s->usb_epoch);
+    cJSON_AddBoolToObject(diag, "usb_mounted", s->usb_mounted);
+    cJSON_AddBoolToObject(diag, "usb_suspended", s->usb_suspended);
     cJSON_AddItemToObject(root, "data", d);
     char *payload = cJSON_PrintUnformatted(root);
     bool ok = payload && strlen(payload) <= 1024 &&
@@ -171,6 +191,8 @@ static bool publish_state(const cloud_wake_status_t *s)
 }
 static bool have_ip(void)
 {
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return false;
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip;
     return netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0;
@@ -194,8 +216,10 @@ static void cloud_task(void *arg)
     (void)arg;
     bool clock_started = false;
     uint32_t last_id = 0; const char *last_result = "";
-    int64_t last_publish = 0;
+    int64_t last_publish = 0, next_publish = 0;
+    unsigned publish_failures=0;
     while (true) {
+        health_phase(HEALTH_CLOUD, "poll_or_retry_wait", 45000);
         if (!have_ip()) { set_state("waiting_wifi"); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
         ensure_dns();
         if (!clock_started) {
@@ -207,12 +231,14 @@ static void cloud_task(void *arg)
         if (time(NULL) < 1704067200) { set_state("waiting_clock"); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
         portENTER_CRITICAL(&lock); bool refresh = refresh_auth; refresh_auth = false; portEXIT_CRITICAL(&lock);
         if (client && refresh) {
+            health_phase(HEALTH_CLOUD, "stop_for_auth_refresh", 120000);
             esp_mqtt_client_stop(client); esp_mqtt_client_destroy(client); client = NULL;
             memset(password, 0, sizeof(password));
             set_state("refreshing_auth"); vTaskDelay(pdMS_TO_TICKS(30000));
         }
         if (!client) {
             set_state("authenticating");
+            health_phase(HEALTH_CLOUD, "authenticate_unbounded_total", 120000);
             if (!authenticate()) { set_state("auth_failed"); vTaskDelay(pdMS_TO_TICKS(30000)); continue; }
             const esp_mqtt_client_config_t cfg = {
                 .broker.address.uri=uri,
@@ -238,9 +264,19 @@ static void cloud_task(void *arg)
         cloud_wake_status_t s; status_fn(&s);
         int64_t now = esp_timer_get_time();
         bool changed = last_id != s.request_id || strcmp(last_result, s.result);
-        if (is_online && now - last_publish >= 1500000 &&
+        if (is_online && now >= next_publish &&
             (requested || changed || now - last_publish >= 25000000)) {
-            if (publish_state(&s)) { last_publish = now; last_id = s.request_id; last_result = s.result; }
+            health_phase(HEALTH_CLOUD, "mqtt_publish", 120000);
+            bool sent=publish_state(&s);
+            int64_t finished=esp_timer_get_time();
+            if (sent) {
+                last_publish=finished; last_id=s.request_id; last_result=s.result;
+                publish_failures=0; next_publish=finished+1500000;
+            } else {
+                if (publish_failures<6) ++publish_failures;
+                next_publish=finished+(int64_t)publish_retry_ms(publish_failures)*1000;
+                portENTER_CRITICAL(&lock); report_requested=true; portEXIT_CRITICAL(&lock);
+            }
         } else if (requested) {
             portENTER_CRITICAL(&lock); report_requested = true; portEXIT_CRITICAL(&lock);
         }
