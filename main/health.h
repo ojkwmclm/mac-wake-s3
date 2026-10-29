@@ -10,3 +10,4 @@ uint32_t health_warnings(void);
 const char *health_boot_id(void);
 int health_reset_reason(void);
 const char *health_fault_state(void);
+const char *health_recovery_mode(void);

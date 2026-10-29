@@ -175,7 +175,7 @@ static bool publish_state(const cloud_wake_status_t *s)
     cJSON_AddStringToObject(diag, "firmware", esp_app_get_description()->version);
     cJSON_AddNumberToObject(diag, "uptime_s", esp_timer_get_time()/1000000);
     cJSON_AddNumberToObject(diag, "reset_reason", health_reset_reason());
-    cJSON_AddStringToObject(diag, "supervisor", "warn_only");
+    cJSON_AddStringToObject(diag, "supervisor", health_recovery_mode());
     cJSON_AddStringToObject(diag, "fault_test", health_fault_state());
     cJSON_AddNumberToObject(diag, "stale_tasks", health_warnings());
     cJSON_AddNumberToObject(diag, "release_mask", s->release_mask);

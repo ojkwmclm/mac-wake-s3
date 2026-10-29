@@ -14,6 +14,13 @@ menu "Mac Wake S3"
         help
             Optional fallback. Default only sends USB remote resume.
             Enable only after testing; this can affect a foreground application.
+    config WAKE_HEALTH_RESET
+        bool "EXPERIMENTAL: watchdog for stopped USB/button workers"
+        depends on ESP_TASK_WDT_EN && ESP_TASK_WDT_INIT && ESP_TASK_WDT_PANIC
+        default n
+        help
+            Uses an IDF TWDT user; cloud offline never stops feeding.
+            Default disabled until controlled reset validation passes.
     config WAKE_HEALTH_FAULT_TEST
         bool "TEST ONLY: pause USB worker 60s once after 60s uptime"
         default n
