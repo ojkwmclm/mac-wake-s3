@@ -157,7 +157,7 @@ static void set_result(const char *value)
 // One request at a time; reject duplicate retries instead of repeatedly waking Mac.
 static bool enqueue_action(bool sleep, uint32_t *id)
 {
-#ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
+#if defined(CONFIG_WAKE_HEALTH_FAULT_TEST) || defined(CONFIG_WAKE_HEALTH_RESET_TEST)
     // Do not queue delayed sleep/wake actions during the intentional worker pause.
     if (!strcmp(health_fault_state(), "usb_paused")) return false;
 #endif

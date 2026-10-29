@@ -6,6 +6,9 @@
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
 #endif
+#ifdef CONFIG_WAKE_HEALTH_RESET_TEST
+#include "nvs.h"
+#endif
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,19 +34,40 @@ static bool suppress_recovery;
 #endif
 const char *health_recovery_mode(void)
 { portENTER_CRITICAL(&lock); const char *v=recovery_mode; portEXIT_CRITICAL(&lock); return v; }
-#ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
+#if defined(CONFIG_WAKE_HEALTH_FAULT_TEST) || defined(CONFIG_WAKE_HEALTH_RESET_TEST)
 static bool fault_started;
 static const char *fault_state="armed";
 #endif
 const char *health_fault_state(void)
 {
-#ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
+#if defined(CONFIG_WAKE_HEALTH_FAULT_TEST) || defined(CONFIG_WAKE_HEALTH_RESET_TEST)
     portENTER_CRITICAL(&lock); const char *value=fault_state;
     portEXIT_CRITICAL(&lock); return value;
 #else
     return "off";
 #endif
 }
+#ifdef CONFIG_WAKE_HEALTH_RESET_TEST
+static bool test_prepared;
+static nvs_handle_t test_nvs;
+static bool test_store_open;
+static void prepare_reset_test(void)
+{
+    if (test_prepared) return;
+    test_prepared=true;
+    uint8_t consumed=0;
+    esp_err_t err=nvs_open("health_test", NVS_READWRITE, &test_nvs);
+    test_store_open=err==ESP_OK;
+    if (test_store_open) err=nvs_get_u8(test_nvs, "r052_01", &consumed);
+    if (err==ESP_ERR_NVS_NOT_FOUND) err=ESP_OK;
+    if (err!=ESP_OK || consumed) {
+        fault_started=true;
+        portENTER_CRITICAL(&lock); fault_state=err==ESP_OK ? "consumed" : "test_storage_failed";
+        portEXIT_CRITICAL(&lock);
+        if (test_store_open) { nvs_close(test_nvs); test_store_open=false; }
+    }
+}
+#endif
 static const char *names[] = {"usb", "button", "cloud"};
 
 void health_init(void)
@@ -70,6 +94,29 @@ uint32_t health_warnings(void)
 void health_phase(health_task_t task, const char *phase, uint32_t warn_ms)
 {
     int64_t now = esp_timer_get_time();
+#ifdef CONFIG_WAKE_HEALTH_RESET_TEST
+    if (task==HEALTH_USB) {
+        prepare_reset_test();
+        if (!fault_started && now>=INT64_C(60000000)) {
+            fault_started=true;
+            // Commit BEFORE stopping progress: no reboot can re-arm this test.
+            esp_err_t err=test_store_open ? nvs_set_u8(test_nvs,"r052_01",1) : ESP_FAIL;
+            if (err==ESP_OK) err=nvs_commit(test_nvs);
+            if (test_store_open) { nvs_close(test_nvs); test_store_open=false; }
+            portENTER_CRITICAL(&lock);
+            fault_state=err==ESP_OK ? "usb_paused" : "test_storage_failed";
+            portEXIT_CRITICAL(&lock);
+            if (err==ESP_OK) {
+                ESP_LOGW("health","RESET TEST: USB worker paused 180s, one-shot marker saved");
+                for (unsigned i=0;i<180;++i) vTaskDelay(pdMS_TO_TICKS(1000));
+                portENTER_CRITICAL(&lock); fault_state="reset_not_observed";
+                portEXIT_CRITICAL(&lock);
+            }
+            now=esp_timer_get_time();
+        }
+    }
+#endif
+
 #ifdef CONFIG_WAKE_HEALTH_FAULT_TEST
     // Dedicated test image only: stop ONE worker's heartbeat, still yield CPU.
     // No cloud command can enable this. Once per boot, automatically recovers.

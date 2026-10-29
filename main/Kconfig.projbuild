@@ -21,8 +21,16 @@ menu "Mac Wake S3"
         help
             Uses an IDF TWDT user; cloud offline never stops feeding.
             Default disabled until controlled reset validation passes.
+    config WAKE_HEALTH_RESET_TEST
+        bool "TEST ONLY: one-shot persistent 180s USB worker stop"
+        depends on WAKE_HEALTH_RESET
+        default n
+        help
+            Commits an NVS one-shot marker before stopping the USB worker.
+            A reset must not re-arm this test. Dedicated local test image only.
     config WAKE_HEALTH_FAULT_TEST
         bool "TEST ONLY: pause USB worker 60s once after 60s uptime"
+        depends on !WAKE_HEALTH_RESET_TEST
         default n
         help
             Dedicated diagnostic image. Keeps yielding CPU, allowing cloud and
